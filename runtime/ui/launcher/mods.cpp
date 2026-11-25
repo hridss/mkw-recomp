@@ -743,6 +743,7 @@ void mods_merge_start(const char *exe_dir) {
     G.mcode[0] = G.merror[0] = 0;
     SDL_UnlockMutex(G.lock);
     if (!setup_tool(exe_dir, "mod/merge.py", python, script, sizeof python)) {
+        rt_log("mods: merge skipped (no setup tools)");
         merge_finished(-1, "no_setup", "");
         return;
     }
@@ -928,27 +929,12 @@ void mods_conflict_set(const char *archive, const char *inner, const char *winne
 void mods_merge_sync(const char *exe_dir) {
     mods_poll();   // an import that ended off the page: it enables (and starts a merge) before the wait below
     while (mods_merge_running()) SDL_Delay(50);
-    char python[1200], script[1200];
-    if (!setup_tool(exe_dir, "mod/merge.py", python, script, sizeof python)) {
-        rt_log("mods: merge skipped (no setup tools)");
-        return;
-    }
-    char romfs[PLAT_PATH_MAX * 2], mods[4096], choices[PLAT_PATH_MAX * 2];
-    romfs_root(romfs, sizeof romfs);
-    const char *list = cfg_get("MKW_MODS");
-    snprintf(mods, sizeof mods, "%s", list ? list : "");
-    snprintf(choices, sizeof choices, "%s/mods/choices.json", cfg_game_dir());
-    const char *args[] = {python, "-I", script, "--game", cfg_game_dir(), "--romfs", romfs,
-                          "--enable", mods, "--choices", choices, nullptr};
-    rt_log("mods: merge at Play %s", mods);
-    SDL_Process *proc = SDL_CreateProcess(args, false);   // output inherits ours: the log shows it
-    if (!proc) {
-        rt_log("mods: merge at Play failed to start: %s", SDL_GetError());
-        return;
-    }
-    int code = -1;
-    SDL_WaitProcess(proc, true, &code);
-    SDL_DestroyProcess(proc);
-    rt_log("mods: merge at Play ended with code %d", code);
-    mods_refresh(exe_dir);
+    // The page's piped merge, not a spawn of its own here: an inheriting console Python gets a console window of
+    // its own beside the GUI start screen on Windows (a black one for the whole merge), and a pythonw with an
+    // inherited stdio has no stream at all for its event lines.
+    rt_log("mods: merge at Play");
+    mods_merge_start(exe_dir);
+    while (mods_merge_running()) SDL_Delay(50);
+    mods_poll();             // the reader's pending_refresh: conflicts.json changed
+    mods_refresh(exe_dir);   // the page's list, as the own spawn refreshed it before
 }

@@ -147,9 +147,11 @@ def clean_name(name):
 
 
 def main():
-    # SDL reads these pipes as UTF-8; Windows Python otherwise uses the active code page, even with -I.
+    # SDL reads these pipes as UTF-8; Windows Python otherwise uses the active code page, even with -I. Under
+    # pythonw.exe (the start screen's Python) stderr can be missing altogether: stdout is the line protocol then.
     sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8", errors=sys.stderr.errors)
+    if sys.stderr is not None:
+        sys.stderr.reconfigure(encoding="utf-8", errors=sys.stderr.errors)
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--game", required=True)
     ap.add_argument("--romfs", required=True)

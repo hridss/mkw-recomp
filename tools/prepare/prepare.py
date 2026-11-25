@@ -57,6 +57,8 @@ def _early_log() -> bool:
         (game / "logs").mkdir(parents=True, exist_ok=True)
         sys.stderr = open(game / "logs/setup.log", "w", encoding="utf-8", buffering=1)  # noqa: SIM115
     except ValueError, IndexError, OSError:
+        if sys.stderr is None:  # no setup.log, spawned as pythonw (the start screen's Python): emit's stderr line
+            sys.stderr = sys.stdout  # still needs a stream — the launcher's pipe, which it reads into its log
         return False
     print(f"setup: started, Python {sys.version.split()[0]}, {sys.executable}", file=sys.stderr)
     faulthandler.dump_traceback_later(STALL_S, repeat=True, file=sys.stderr)

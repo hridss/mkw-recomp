@@ -29,21 +29,33 @@ static SDL_Process *g_proc;
 
 // The Python and prepare.py: the package's (setup/python, setup/src) beside the executable, else a source checkout's
 // (the executable in build/: the repository's .venv and tools/). rel names the tool under tools/ ("prepare/prepare.py").
+// Windows asks for pythonw.exe (the GUI Python) first: the start screen is a GUI program with no console, and every
+// console python.exe it spawns gets a console window of its own — a black one beside the launcher for the script's
+// whole run. pythonw gets none; its scripts have the stdout pipe and, where they write one, their own stderr
+// (prepare.py opens logs/setup.log; import.py guards its reconfigure). Tools those scripts run themselves share one
+// hidden console (own_children in tools/prepare/machine.py). python.exe stays as the fallback of a package without
+// pythonw, where the old behaviour (machine.py hides the setup's window from within) is all there is.
 static bool find_tool(const char *exe_dir, const char *rel, char *python, char *script, size_t cap) {
 #ifdef _WIN32
-    snprintf(python, cap, "%s/setup/python/python.exe", exe_dir);
+    const char *const pydirs[] = {"setup/python", "../.venv/Scripts"};
+    const char *const trees[] = {"setup/src/tools", "../tools"};
+    for (int i = 0; i < 2; i++) {
+        snprintf(script, cap, "%s/%s/%s", exe_dir, trees[i], rel);
+        if (!plat_file_exists(script)) continue;
+        snprintf(python, cap, "%s/%s/pythonw.exe", exe_dir, pydirs[i]);
+        if (plat_file_exists(python)) return true;
+        snprintf(python, cap, "%s/%s/python.exe", exe_dir, pydirs[i]);
+        if (plat_file_exists(python)) return true;
+    }
+    return false;
 #else
     snprintf(python, cap, "%s/setup/python/bin/python3", exe_dir);
-#endif
     snprintf(script, cap, "%s/setup/src/tools/%s", exe_dir, rel);
     if (plat_file_exists(python) && plat_file_exists(script)) return true;
-#ifdef _WIN32
-    snprintf(python, cap, "%s/../.venv/Scripts/python.exe", exe_dir);
-#else
     snprintf(python, cap, "%s/../.venv/bin/python3", exe_dir);
-#endif
     snprintf(script, cap, "%s/../tools/%s", exe_dir, rel);
     return plat_file_exists(python) && plat_file_exists(script);
+#endif
 }
 
 int setup_available(const char *exe_dir) {

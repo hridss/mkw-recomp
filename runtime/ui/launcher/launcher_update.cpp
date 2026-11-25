@@ -47,15 +47,20 @@ static void fail(UpdateState &s, const char *why) {
     snprintf(s.error, sizeof s.error, "%s", why);
 }
 
-// The package's Python and update.py; a source checkout has no update (it is updated with git).
+// The package's Python and update.py; a source checkout has no update (it is updated with git). pythonw.exe first:
+// a console python.exe spawned by the GUI start screen gets a console window of its own (launcher_setup.cpp's
+// find_tool); python.exe stays as the fallback of a package without pythonw.
 static bool find_tools(const char *exe_dir, char *python, char *script, size_t cap) {
+    snprintf(script, cap, "%s/setup/src/tools/prepare/update.py", exe_dir);
+    if (!plat_file_exists(script)) return false;
 #ifdef _WIN32
+    snprintf(python, cap, "%s/setup/python/pythonw.exe", exe_dir);
+    if (plat_file_exists(python)) return true;
     snprintf(python, cap, "%s/setup/python/python.exe", exe_dir);
 #else
     snprintf(python, cap, "%s/setup/python/bin/python3", exe_dir);
 #endif
-    snprintf(script, cap, "%s/setup/src/tools/prepare/update.py", exe_dir);
-    return plat_file_exists(python) && plat_file_exists(script);
+    return plat_file_exists(python);
 }
 
 // Packaged and replaceable: on Linux only the AppImage (APPIMAGE, set by its runtime), whose folder takes the download.
@@ -134,7 +139,9 @@ static void prepare_next(void) {
     const char *ver = s.tag[0] == 'v' ? s.tag + 1 : s.tag;   // prepare.py --port, the version as the build spells it
 #ifdef _WIN32
     char python[1300], script[1300];
-    snprintf(python, sizeof python, "%s/setup/python/python.exe", s.path);
+    // pythonw.exe first: no console window for the beside setup (find_tools); python.exe for a package without it
+    snprintf(python, sizeof python, "%s/setup/python/pythonw.exe", s.path);
+    if (!plat_file_exists(python)) snprintf(python, sizeof python, "%s/setup/python/python.exe", s.path);
     snprintf(script, sizeof script, "%s/setup/src/tools/prepare/nextsetup.py", s.path);
     bool can = plat_file_exists(script);   // a package from before --next: its start sets up as before
     snprintf(script, sizeof script, "%s/setup/src/tools/prepare/prepare.py", s.path);
@@ -497,6 +504,19 @@ void update_relaunch(const char *exe_dir) {
 #endif
 }
 
+// Reaps the after-update clean: its piped output read away (a pipe nobody reads would stop the script once full)
+// and the process freed. Nobody waits on the clean itself, as before.
+static int SDLCALL clean_reader(void *arg) {
+    SDL_Process *p = (SDL_Process *)arg;
+    size_t n = 0;
+    int code = -1;
+    char *out = (char *)SDL_ReadProcess(p, &n, &code);
+    if (code) rt_log("update: the after-update clean ended with code %d", code);
+    SDL_free(out);
+    SDL_DestroyProcess(p);
+    return 0;
+}
+
 int update_just_installed(const char *exe_dir, char *tag, unsigned cap) {
     if (updates_managed_externally()) return 0;
     char p[1200];
@@ -508,8 +528,11 @@ int update_just_installed(const char *exe_dir, char *tag, unsigned cap) {
     if (find_tools(exe_dir, python, script, sizeof python)) {   // the *.old files: nobody waits for it
         const char *args[] = {python, "-I",   script, "clean", "--game", exe_dir, replaced[0] ? "--previous" : nullptr,
                               replaced, nullptr};
-        SDL_Process *c = SDL_CreateProcess(args, false);
-        if (c) SDL_DestroyProcess(c);
+        // Piped like every other spawn: an inheriting console Python gets a console window of its own beside the
+        // GUI start screen, and a pythonw with inherited stdio has no stream at all to write its lines to.
+        SDL_Process *c = SDL_CreateProcess(args, true);
+        if (c) SDL_DetachThread(SDL_CreateThread(clean_reader, "update-clean", c));
+        else rt_log("update: cannot start the clean: %s", SDL_GetError());
     }
     rt_log("update: %s installed by the previous run", tag);
     return 1;

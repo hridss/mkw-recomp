@@ -8,7 +8,8 @@
 // Threads: the window thread (the back end's) owns the window and never runs guest code. The vsync thread signals the
 // bound system events. Presents come from any host thread (the back end's present worker) and take g_pl; every queue
 // submission takes the recursive queue lock (vk_queue_lock). The swapchain is rebuilt lazily: a resize only marks it
-// dirty (gfx_window_mark_dirty), the next present (or gfx_window_resize) rebuilds it.
+// dirty (gfx_window_mark_dirty), the next present (or gfx_window_resize) rebuilds it. A rebuild that fails waits
+// before the next try (sc_retry_due), rather than waiting for the device idle on every present.
 //
 // The in-game menu (ui/menu/menu.h) draws over the game image in the present's command buffer, after the blit. The window's
 // size and fullscreen state are the settings MKW_WINDOW_SIZE and MKW_FULLSCREEN, which the back end applies at start
@@ -54,6 +55,19 @@ static volatile int32_t g_focused = 1;
 static volatile int32_t g_focus_msgs;
 static PlatRMutex g_start_lock;       // gfx_window_start / vsync start
 static int g_started;
+
+// A swapchain that cannot be made (VK_ERROR_OUT_OF_DEVICE_MEMORY: its images did not fit next to the game's textures
+// on an 8 GB card at 4K fullscreen) is not tried again on every present. Each try waits for the device idle and holds
+// the queue; in that run the failed tries spent 350-750 ms of every present for minutes, and 454 of them were logged.
+// The next try waits instead, and idle textures go first: their memory is VMA's, the swapchain's is the driver's, so
+// no VMA allocation failure tells the texture cache to free anything for it.
+#define SC_RETRY_FAST_NS 250000000ull    // before three failures in a row
+#define SC_RETRY_SLOW_NS 1000000000ull   // after them
+static uint64_t g_sc_retry_at;           // ns, kern_now_ns's clock; 0: a try is due now
+static unsigned g_sc_fails;
+static uint64_t g_sc_fail_logged;
+
+static int sc_retry_due(void) { return kern_now_ns() >= g_sc_retry_at; }
 
 void gfx_window_mark_dirty(void) { plat_xchg32(&g_dirty, 1); }
 
@@ -602,11 +616,32 @@ static int create_swapchain(void) {
     VkResult r = vkCreateSwapchainKHR(c->device, &ci, NULL, &g_sc);
     vk_lat_swapchain(0, r == VK_SUCCESS ? g_sc : old);
     if (r != VK_SUCCESS) {
-        rt_log("gfx: vkCreateSwapchainKHR failed (%d)", (int)r);
-        g_sc = old;
+        uint64_t now = kern_now_ns();
+        g_sc_retry_at = now + (++g_sc_fails < 3 ? SC_RETRY_FAST_NS : SC_RETRY_SLOW_NS);
+        g_sc = old;   // the one that was there presents on until a try succeeds
         vk_queue_unlock();
+        // Room for the next try: idle textures go (the device is idle above). Their memory is VMA's; the swapchain's
+        // images are the driver's, so VMA's own out-of-memory path never tells the texture cache to free anything here.
+        int trimmed = vk_texture_trim(64ull << 20);
+        if (g_sc_fails <= 3 || now - g_sc_fail_logged > 5000000000ull) {
+            VmaBudget vb[VK_MAX_MEMORY_HEAPS];
+            uint64_t blocks = 0, budget = 0, usage = 0;
+            vmaGetHeapBudgets(c->vma, vb);
+            for (uint32_t h = 0; h < c->mem_props.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
+                if (c->mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                    blocks += vb[h].statistics.blockBytes, budget += vb[h].budget, usage += vb[h].usage;
+            rt_log("gfx: vkCreateSwapchainKHR failed (%d) for %ux%u, %u in a row: device-local blocks %llu of %llu MiB "
+                   "budget, driver usage %llu MiB, %s; next try in %llu ms",
+                   (int)r, ext.width, ext.height, g_sc_fails, (unsigned long long)(blocks >> 20),
+                   (unsigned long long)(budget >> 20), (unsigned long long)(usage >> 20),
+                   trimmed ? "idle textures trimmed" : "nothing idle to trim",
+                   (unsigned long long)((g_sc_retry_at - now) / 1000000ull));
+            g_sc_fail_logged = now;
+        }
         return 0;
     }
+    g_sc_fails = 0;
+    g_sc_retry_at = 0;
     for (uint32_t i = 0; i < g_sc_n; i++) {
         vkDestroySemaphore(c->device, g_render_done[i], NULL);
         if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
@@ -868,8 +903,12 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     plat_rmutex_lock(&g_pl);
     if (defer != 2 || g_flip_n >= g_ahead) flip_locked();   // (no more acquired images than the swapchain spares)
     if (gfx_hdr_cfg_changed()) plat_xchg32(&g_dirty, 1);   // MKW_HDR switched in the menu: HDR10 or SDR from now on
-    if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
-        if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
+    if (!g_sc) {
+        // nothing to present into: make one, at most one try per retry wait after a failure
+        if (wsys_minimized() || !sc_retry_due() || !create_swapchain()) goto out;
+    } else if (plat_cas32(&g_dirty, 0, 0)) {
+        if (sc_retry_due()) create_swapchain();   // a failed try keeps this chain and waits before the next
+        else plat_xchg32(&g_dirty, 1);            // the try this present would have made is not due yet
     }
     if (wsys_minimized() || !g_sc) goto out;
     if (!g_capture && turbo_drop_present(kern_now_ns())) goto out;   // turbo: the window shows at most 60 a second
@@ -895,7 +934,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     }
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         plat_xchg32(&g_dirty, 1);
-        if (!create_swapchain()) goto out;
+        if (!sc_retry_due() || !create_swapchain()) goto out;
         r = vkAcquireNextImageKHR(c->device, g_sc, 1000000000ull, g_acquire[slot], VK_NULL_HANDLE, &idx);
     }
     static int acquire_fails;   // in a row: a timeout or a failure that keeps coming means the swapchain went bad

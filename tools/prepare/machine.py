@@ -175,8 +175,10 @@ def own_children() -> None:
                     ("job_memory", ctypes.c_size_t), ("peak_process", ctypes.c_size_t), ("peak_job", ctypes.c_size_t)]  # fmt: skip
 
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    # Started by the start screen (a GUI program) python.exe gets a console window of its own; hidden here, and every
-    # tool below (gen.py's workers, zig, glslc) shares that console instead of opening one each.
+    # The start screen spawns this Python as pythonw.exe, which has no console — and with every tool below spawned
+    # with piped stdio (gen.py's workers, zig, glslc), none of them gets a console window of its own either. An old
+    # package's python.exe fallback is a console program and does get one: hidden here, and its tools share that
+    # console instead of opening one each.
     k32.GetConsoleWindow.restype = wintypes.HWND
     console = k32.GetConsoleWindow()
     if console:

@@ -1,5 +1,6 @@
 // The SDL3 back end of the window (gfx_wsys.h), for hosts without Win32: the window on a thread of its own that also
-// runs SDL's event loop, F11 fullscreen (borderless, the desktop's mode), the settings MKW_WINDOW_SIZE and
+// runs SDL's event loop, F11 fullscreen (MKW_WINDOW_SIZE's display mode, the desktop's when it is already that size),
+// the settings MKW_WINDOW_SIZE and
 // MKW_FULLSCREEN, the display's refresh rate, focus, the Vulkan surface. The swapchain and the present are
 // gfx_present.c's. Keyboard and mouse events go to input_sdl.c and to the menu (ui/menu/menu_sdl.cpp).
 //
@@ -86,9 +87,45 @@ static void set_pixel_size(int w, int h) {
     SDL_SetWindowSize(g_win, (int)(w / density + 0.5f), (int)(h / density + 0.5f));
 }
 
+static double mode_hz(const SDL_DisplayMode *m) {
+    if (!m) return 0;
+    if (m->refresh_rate_denominator) return (double)m->refresh_rate_numerator / (double)m->refresh_rate_denominator;
+    return m->refresh_rate;
+}
+
+// The mode fullscreen asks for: MKW_WINDOW_SIZE's pixels at the display's refresh rate, not the desktop's mode. The
+// swapchain follows the window, so a 4K desktop made every fullscreen run present at 4K: four times the picture's
+// pixels for the upscale, the present blit and frame generation, and swapchain images that no longer fit an 8 GB card
+// next to the game's textures (vkCreateSwapchainKHR answered VK_ERROR_OUT_OF_DEVICE_MEMORY for minutes in a 4K
+// fullscreen run, every present waiting on the failed retry). A display already at that size keeps the desktop's
+// borderless mode, no mode switch; one that cannot show it keeps its own mode (SDL's closest is asked first).
+static void apply_fullscreen_mode(int on) {
+    if (!on) {
+        SDL_SetWindowFullscreenMode(g_win, NULL);   // the desktop's mode again
+        return;
+    }
+    int w = 0, h = 0, mw = 0, mh = 0;
+    gfx_cfg_window_size(&w, &h);
+    SDL_DisplayID d = SDL_GetDisplayForWindow(g_win);
+    if (!d) d = SDL_GetPrimaryDisplay();
+    if (gfx_window_monitor_size(&mw, &mh) && mw == w && mh == h) {
+        SDL_SetWindowFullscreenMode(g_win, NULL);   // the desktop already shows it: borderless, no mode switch
+        return;
+    }
+    SDL_DisplayMode m;
+    if (SDL_GetClosestFullscreenDisplayMode(d, w, h, 0, false, &m)) {
+        SDL_SetWindowFullscreenMode(g_win, &m);
+        rt_log("gfx: fullscreen %dx%d at %.2f Hz for the %dx%d window (MKW_WINDOW_SIZE)", m.w, m.h, mode_hz(&m), w, h);
+    } else {
+        SDL_SetWindowFullscreenMode(g_win, NULL);
+        rt_log("gfx: no display mode for the %dx%d window: fullscreen in the desktop's mode", w, h);
+    }
+}
+
 static void set_fullscreen(int on) {
     input_cursor_suspend(1);
-    SDL_SetWindowFullscreen(g_win, on);   // the desktop's mode: borderless over the display
+    apply_fullscreen_mode(on);
+    SDL_SetWindowFullscreen(g_win, on);
     SDL_SyncWindow(g_win);
     input_cursor_suspend(0);
 }
@@ -102,9 +139,10 @@ static void apply_settings(void) {
     if (size_changed) {
         int w, h;
         gfx_cfg_window_size(&w, &h);
-        if (is_fullscreen()) SDL_SetWindowFullscreen(g_win, false);
+        int was_fs = is_fullscreen();
+        if (was_fs) set_fullscreen(0);   // the mode follows the new size
         set_pixel_size(w, h);
-        if (is_fullscreen() || (fs && !fs_changed)) SDL_SetWindowFullscreen(g_win, true);
+        if (was_fs || (fs && !fs_changed)) set_fullscreen(1);
     }
     if (fs_changed && fs != is_fullscreen()) set_fullscreen(fs);
 }
@@ -120,10 +158,7 @@ void gfx_window_request_close(void) {
 // ---- the display's refresh rate and size
 static void refresh_rate_update(void) {
     const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_win));
-    double hz = 0;
-    if (m && m->refresh_rate_denominator) hz = (double)m->refresh_rate_numerator / m->refresh_rate_denominator;
-    else if (m) hz = m->refresh_rate;
-    gfx_window_set_refresh(hz);
+    gfx_window_set_refresh(mode_hz(m));
 }
 
 int gfx_window_monitor_size(int *w, int *h) {
@@ -138,17 +173,12 @@ int gfx_window_monitor_size(int *w, int *h) {
 static int video_up(void);
 
 // The lines of the picture the window will show, for the game's output size before the window exists
-// (patches.c): the monitor's in fullscreen (its desktop mode, in pixels), else MKW_WINDOW_SIZE's. 0 when unknown.
+// (patches.c): MKW_WINDOW_SIZE's, which fullscreen asks for as the display mode as well; once the window exists, the
+// mode it got is the answer (a display that cannot show the asked size keeps its own). 0 when unknown.
 int gfx_window_shape(int *w, int *h) {
-    if (!gfx_cfg_fullscreen()) {
-        gfx_cfg_window_size(w, h);
-        return *h > 0;
-    }
-    if (!video_up()) return 0;
-    const SDL_DisplayMode *m = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
-    if (!m) return 0;
-    *w = (int)(m->w * m->pixel_density + 0.5f), *h = (int)(m->h * m->pixel_density + 0.5f);
-    return 1;
+    if (gfx_cfg_fullscreen() && g_win && gfx_window_monitor_size(w, h)) return 1;
+    gfx_cfg_window_size(w, h);
+    return *h > 0;
 }
 
 int gfx_window_lines(void) {
@@ -349,7 +379,10 @@ static void open_window(void *arg) {
     note_applied();
     refresh_rate_update();
     if (background) rt_log("gfx: window opened in the background, not focusable (MKW_BACKGROUND_WINDOW)");
-    if (gfx_cfg_fullscreen() && !background) SDL_SetWindowFullscreen(g_win, true);
+    if (gfx_cfg_fullscreen() && !background) {
+        apply_fullscreen_mode(1);   // the settings' size as the display mode, before the window goes fullscreen
+        SDL_SetWindowFullscreen(g_win, true);
+    }
     SDL_SyncWindow(g_win);
     input_sdl_window(g_win);
     open_ok = 1;
