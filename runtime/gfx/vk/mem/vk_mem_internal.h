@@ -254,6 +254,8 @@ void mirror_reset(VkCtx *c);
 // vk_mem_log.c: census, VRAM summary and the memory mode
 void flag_names(uint32_t f, char *buf, size_t n);
 void vram_log(uint64_t frame);
+void vram_log_later(void);   // vram_log at the next present: for callers that hold pool_lock (it takes tex_lock)
+void vk_pool_census_log(void);   // vk_memory.c: the live pool records by state (a line after vram_log's)
 
 // vk_mem_upload.c: upload batches and deferred destruction
 void vk_mem_grow(void **arr, int *cap, size_t elem);

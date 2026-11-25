@@ -62,7 +62,9 @@ class Replayer:
             sys.exit(f"replay {self.n} failed (exit {r.returncode}): {self.out}/r{self.n:02d}.log")
         img = Image.open(pngs[-1]).convert("RGB")
         n = rest = 0
-        for px in img.get_flattened_data():
+        # get_flattened_data() exists only in Pillow 12; the pin is 11.3 (#174)
+        pixels = img.get_flattened_data() if hasattr(img, "get_flattened_data") else img.getdata()
+        for px in pixels:
             if self.match(*px):
                 n += 1
             elif max(px) >= 24:

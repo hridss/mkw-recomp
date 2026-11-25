@@ -35,4 +35,7 @@ export MKW_SEQ_WATCH=${MKW_SEQ_WATCH:-1} MKW_SEQ_UNTIL=${MKW_SEQ_UNTIL--WaitIntr
 export MKW_TURBO=${MKW_TURBO:-until} MKW_SKIP_MOVIES=${MKW_SKIP_MOVIES:-1}
 export WORLD_SECS=${WORLD_SECS:-$(( ${RACE_SECS:-20} + 30 ))}
 export MKW_FLIGHT=${MKW_FLIGHT:-1} MKW_FLIGHT_SPIKE_MS=${MKW_FLIGHT_SPIKE_MS:-0} MKW_FLIGHT_AT=${MKW_FLIGHT_AT:-2000,2700,2900,3000}
-exec tools/run/run_perf.sh "$1" "${2:-240}"
+# The wall-clock kill grows with WORLD_SECS: the race runs at ~0.5x on the 660M (mem5, 24/11/2026: a cup with
+# WORLD_SECS=2000 killed in its first race by the default 240 s).
+secs=$(( WORLD_SECS * 2 + 60 )); [ "$secs" -ge 240 ] || secs=240
+exec tools/run/run_perf.sh "$1" "${2:-$secs}"

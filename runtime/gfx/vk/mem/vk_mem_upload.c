@@ -258,6 +258,7 @@ void vk_mem_relieve(uint64_t bytes, const char *what) {
     uint64_t t0 = plat_now_ns();
     vk_texture_trim(bytes);
     plat_once(&cmd_once, cmd_init, NULL);
+    if (__atomic_load_n(&cmd_lock.owner, __ATOMIC_RELAXED) != plat_thread_id()) vk_sparse_binds_now();   // as vk_upload_flush
     plat_rmutex_lock(&cmd_lock);
     int outside = !depth;
     if (outside) vk_upload_flush(1);
@@ -304,6 +305,12 @@ void vk_upload_flush_over(VkDeviceSize limit) {
 
 uint64_t vk_upload_flush(int wait) {
     plat_once(&cmd_once, cmd_init, NULL);
+    // The sparse binds still pending first, as a frame part does (vk_sync.c): a copy in this batch into a tile mapped
+    // since the last submission (WriteTexels) landed on unbound memory and was lost (probe-vkmem's sparse tile,
+    // 24/11/2026). Before cmd_lock, and not when this thread already holds it (vk_mem_relieve, a flush inside
+    // vk_upload_begin): the binds take sp_lock, and slot_get takes cmd_lock under sp_lock, so taking sp_lock
+    // under cmd_lock would invert that order.
+    if (__atomic_load_n(&cmd_lock.owner, __ATOMIC_RELAXED) != plat_thread_id()) vk_sparse_binds_now();
     plat_rmutex_lock(&cmd_lock);
     VkCtx *c = vk_ctx();
     uint64_t seq = next_seq;

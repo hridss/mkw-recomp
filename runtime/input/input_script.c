@@ -26,8 +26,12 @@
 // A line "<node>+<ticks> ..." waits for a phase of the game instead (MKW_SEQ_WATCH=1, seqwatch.c): it lands <ticks>
 // after the node's first start, so a press in a menu does not depend on how long the menus before it took (turbo, loads).
 // A line that starts with "p<N> " (N 1-8) presses for player N (input_poll_player); without it, for player 1.
+// "<frame> <button> <hold> <every>": held, but let go for the first PULSE_TICKS of every <every> ticks of <hold>
+// (untimed lines only): a new press every <every> ticks for screens that move on with one, while still held for the
+// kart's throttle (mem6c, 24/11/2026: A pressed 6 of 90 ticks left the GP's kart standing at the start).
+#define PULSE_TICKS 6
 typedef struct {
-    uint64_t at, hold;
+    uint64_t at, hold, every;
     int bit, stick, timed, player;
     int32_t x, y;
     int logged;
@@ -72,7 +76,9 @@ static int script_parse(char *line, int ln, ScriptEv *out) {
         for (size_t i = 0; i < sizeof script_buttons / sizeof *script_buttons; i++)
             if (!strcmp(name, script_buttons[i].name)) e.bit = script_buttons[i].bit;
         if (e.bit < 0) { rt_log("input: script line %d: unknown button %s", ln, name); return -1; }
-        if (sscanf(line + off, "%lf", &c) == 1 && c > 0) e.hold = (uint64_t)(c * unit + 0.5);
+        int n = sscanf(line + off, "%lf %ld", &c, &a);
+        if (n >= 1 && c > 0) e.hold = (uint64_t)(c * unit + 0.5);
+        if (n == 2 && a > PULSE_TICKS && !timed) e.every = (uint64_t)a;   // a press every <a> ticks while held
         snprintf(e.text, sizeof e.text, "%s%s", who, name);
     }
     snprintf(e.node, sizeof e.node, "%s", node);
@@ -119,8 +125,10 @@ static const char *const quick_gp[] = {
     "TitleWait+40 A 6",         "TitleMenuMain+40 A 6",     "TitleMenuMain+230 A 6",   "PartsSelectEx+60 A 6",
     "PartsSelectEx+180 A 6",    "GrandprixListup+60 A 6",   "GrandprixListup+150 A 6", "GrandprixListup+240 A 6",
     "SimpleConfirm+40 A 6",     "IntoRace2+120 A 6",        "IntoRace2+300 A 6",       "IntoRace2+480 A 6",
-    "IntoRace2+660 A 6",        "IntoRace2+800 A 4320000",
+    "IntoRace2+660 A 6",        "IntoRace2+800 A 4320000 90",
 };
+// The last line holds A and lets it go for 0.1 s every 1.5 s to the end: phase lines fire on a node's first start
+// only, and a held A never leaves the race results (mem6b, 24/11/2026: the cup sat on the first race's results until A was pressed by ctl).
 static const char *const quick_free[] = {"TitleWait+40 A 6", "TitleMenuMain+60 PLUS 6"};
 
 static void script_load_quick(const char *mode) {
@@ -198,6 +206,7 @@ static void script_apply_locked(uint64_t *b, int32_t sl[2], int32_t sr[2], int p
             if (e->timed) rt_log("input: script frame %llu at %.1f ms: %s", (unsigned long long)fr, w / 1000.0, e->text);
             else rt_log("input: script frame %llu tick %llu: %s", (unsigned long long)fr, (unsigned long long)tick, e->text);
         }
+        if (e->every && (now - e->at) % e->every < PULSE_TICKS) continue;   // the short release, then held again
         if (e->stick) { int32_t *s = e->stick == 1 ? sl : sr; s[0] = e->x; s[1] = e->y; }
         else *b |= 1ull << e->bit;
     }

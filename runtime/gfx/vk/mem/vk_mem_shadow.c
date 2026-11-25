@@ -76,7 +76,7 @@ int shadow_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
         rt_log("vk: pool %#llx+%#llx: shadow allocation failed (%d)", (unsigned long long)addr, (unsigned long long)size,
                (int)res);
         static int reported;
-        if (reported++ < 3) vram_log(0);   // what holds the memory
+        if (reported++ < 3) vram_log_later();   // what holds the memory (lazy_back holds pool_lock here)
         r->buf = VK_NULL_HANDLE, r->salloc = NULL;
         return 0;
     }

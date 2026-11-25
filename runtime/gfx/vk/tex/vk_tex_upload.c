@@ -87,6 +87,24 @@ static void astc_check(const Tex *e, const uint8_t *raw, const VkAstcRegion *ar,
                (unsigned long long)n_texels, (unsigned long long)n_diff_tex);
 }
 
+// Staging of an upload in groups of levels and layers (upload, upload_texpre): a group holds up to UP_CHUNK (a larger
+// level or layer goes alone) and the batch is sent before the next group once it holds UP_FLUSH. One staging buffer per
+// texture killed tr1 (18/11/2026, Radeon 660M): 47 568 848 bytes with 517 MiB free inside VMA's blocks but no such run
+// in one piece; a group comes from the staging pool's 64 MiB blocks (vk_mem_upload.c).
+#define UP_CHUNK (8ull << 20)
+#define UP_FLUSH (32ull << 20)
+// The end of the group from region g0 of n (offsets in rg, total bytes); its regions' offsets made relative to it and
+// its bytes in *gtotal.
+static uint32_t up_group(VkBufferImageCopy *rg, uint32_t g0, uint32_t n, VkDeviceSize total, int whole,
+                         VkDeviceSize *gtotal) {
+    VkDeviceSize bias = rg[g0].bufferOffset;
+    uint32_t g1 = g0 + 1;
+    while (g1 < n && (whole || (g1 + 1 < n ? rg[g1 + 1].bufferOffset : total) - bias <= UP_CHUNK)) g1++;
+    *gtotal = (g1 < n ? rg[g1].bufferOffset : total) - bias;
+    for (uint32_t i = g0; i < g1; i++) rg[i].bufferOffset -= bias;
+    return g1;
+}
+
 // An ASTC texture re-encoded as BC7: the BC7 encoded offline for these storage bytes (vk_texpre.c) straight into the
 // image. Without one, the storage is recorded for the offline encoder and 0 sends the upload on through the GPU encoder.
 static int upload_texpre(Tex *e, uint32_t levels, uint32_t layers) {
@@ -107,17 +125,25 @@ static int upload_texpre(Tex *e, uint32_t levels, uint32_t layers) {
         }
     uint64_t h = vk_texpre_hash(t->mem, t->L.size);
     int ok = 0;
-    if (vk_texpre_has(h)) {
-        VkBuffer sb;
-        uint8_t *stg;
-        VkCommandBuffer cb = vk_upload_begin_staging(total, &sb, (void **)&stg);
-        if (stg && vk_texpre_load(h, stg, total)) {
-            barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-            vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
-            barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
-            ok = 1;
+    if (vk_texpre_has(h)) {   // over UP_CHUNK, decoded into memory first and staged in groups
+        uint8_t *bc = total > UP_CHUNK ? malloc(total) : NULL;
+        ok = total > UP_CHUNK ? bc && vk_texpre_load(h, bc, total) : 1;
+        VkDeviceSize done = 0, gtotal;
+        for (uint32_t g0 = 0, g1; ok && g0 < n; g0 = g1, done += gtotal) {
+            g1 = up_group(rg, g0, n, total, !bc, &gtotal);
+            if (g0) vk_upload_flush_over(UP_FLUSH);
+            VkBuffer sb;
+            uint8_t *stg;
+            VkCommandBuffer cb = vk_upload_begin_staging(gtotal, &sb, (void **)&stg);
+            ok = stg && (bc ? (memcpy(stg, bc + done, gtotal), 1) : vk_texpre_load(h, stg, total));
+            if (ok) {
+                barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, g1 - g0, rg + g0);
+                barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+            }
+            vk_upload_end();
         }
-        vk_upload_end();
+        free(bc);
     }
     if (!ok) vk_texpre_record(h, d, pr, (int)n, t->mem, t->L.size);
     free(pr), free(rg);
@@ -242,22 +268,27 @@ static void upload(Tex *e) {
             total += (out + 15) & ~15ull;
             decoded += texels * 4;
         }
+    // In groups (up_group); MKW_ASTC=check in one.
     vk_upload_flush_over(64ull << 20);   // as vk_tex_texel.c: the load of a capture sent its textures in one batch
     VkBuffer sb, rbuf = VK_NULL_HANDLE;
     VmaAllocation ralloc = NULL;
-    uint8_t *stg;
-    VkCommandBuffer cb = vk_upload_begin_staging(total, &sb, (void **)&stg);
+    uint8_t *stg, *raw_copy = NULL;
     uint8_t *rmap = acheck ? vk_staging(decoded, &rbuf, &ralloc) : NULL;
-    UpPart *pt = calloc(n, sizeof *pt);
-    uint32_t items = 0;
-    uint64_t raw_all = 0;
-    k = 0;
-    for (uint32_t lv = 0; lv < levels; lv++)
-        for (uint32_t ly = 0; ly < layers; ly++, k++) {
+    int checked = 0;
+    for (uint32_t g0 = 0, g1; g0 < n; g0 = g1) {
+        VkDeviceSize gtotal;
+        g1 = up_group(rg, g0, n, total, acheck, &gtotal);
+        if (g0) vk_upload_flush_over(UP_FLUSH);
+        VkCommandBuffer cb = vk_upload_begin_staging(gtotal, &sb, (void **)&stg);
+        UpPart *pt = calloc(g1 - g0, sizeof *pt);
+        uint32_t items = 0;
+        uint64_t raw_all = 0;
+        for (k = g0; k < g1; k++) {
+            uint32_t lv = k / layers, ly = k % layers;
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh, all = 0;
             size_t raw = (size_t)rb * rows * sl;
-            UpPart *q = &pt[k];
+            UpPart *q = &pt[k - g0];
             q->level = lv + drop, q->layer = ly, q->pitch = rb, q->first = items;
             q->tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
             q->dst = q->tmp ? q->tmp : stg + rg[k].bufferOffset;
@@ -266,34 +297,33 @@ static void upload(Tex *e) {
             items += q->band ? (all + q->band - 1) / q->band : 1;
             raw_all += raw;
         }
-    UpJob job = {d, t->mem, pt, n};
-    uint64_t dz0 = plat_now_ns();
-    if (raw_all >= UP_PAR_MIN) tex_par_for(items, up_deswizzle, &job);
-    else for (uint32_t i = 0; i < items; i++) up_deswizzle(&job, i);
-    if (vk_pool_diag_on()) {   // MKW_MEM_POOL_LABELS: read from a CPU_NO_ACCESS pool's game pages?
-        const pool_t *p = nvn_pool_find(e->pub.addr, 1);
-        if (p) vk_pool_diag_note(p->flags, 1, raw_all);
-        if (p && astc) vk_pool_diag_note(p->flags, 3, raw_all);
-    }
-    if (rt_trace & RT_TRACE_PERF) {   // MKW_TRACE=perf: the deswizzle's wall time on this thread, split and not
-        static volatile int64_t dz_ns[2], dz_bytes[2];
-        static volatile int32_t dz_n;
-        int split = raw_all >= UP_PAR_MIN;
-        __atomic_add_fetch(&dz_ns[split], (int64_t)(plat_now_ns() - dz0), __ATOMIC_RELAXED);
-        __atomic_add_fetch(&dz_bytes[split], (int64_t)raw_all, __ATOMIC_RELAXED);
-        if (plat_inc32(&dz_n) % 256 == 0)
-            rt_log("perf: upload deswizzle: %d uploads; over the texture workers %.1f MiB in %.1f ms, on the caller "
-                   "(under %llu KiB) %.1f MiB in %.1f ms", dz_n, dz_bytes[1] / 1048576.0, dz_ns[1] / 1e6,
-                   UP_PAR_MIN >> 10, dz_bytes[0] / 1048576.0, dz_ns[0] / 1e6);
-    }
-    k = 0;
-    for (uint32_t lv = 0; lv < levels; lv++)
-        for (uint32_t ly = 0; ly < layers; ly++, k++) {
+        UpJob job = {d, t->mem, pt, g1 - g0};
+        uint64_t dz0 = plat_now_ns();
+        if (raw_all >= UP_PAR_MIN) tex_par_for(items, up_deswizzle, &job);
+        else for (uint32_t i = 0; i < items; i++) up_deswizzle(&job, i);
+        if (vk_pool_diag_on()) {   // MKW_MEM_POOL_LABELS: read from a CPU_NO_ACCESS pool's game pages?
+            const pool_t *p = nvn_pool_find(e->pub.addr, 1);
+            if (p) vk_pool_diag_note(p->flags, 1, raw_all);
+            if (p && astc) vk_pool_diag_note(p->flags, 3, raw_all);
+        }
+        if (rt_trace & RT_TRACE_PERF) {   // MKW_TRACE=perf: the deswizzle's wall time on this thread, split and not
+            static volatile int64_t dz_ns[2], dz_bytes[2];
+            static volatile int32_t dz_n;
+            int split = raw_all >= UP_PAR_MIN;
+            __atomic_add_fetch(&dz_ns[split], (int64_t)(plat_now_ns() - dz0), __ATOMIC_RELAXED);
+            __atomic_add_fetch(&dz_bytes[split], (int64_t)raw_all, __ATOMIC_RELAXED);
+            if (plat_inc32(&dz_n) % 256 == 0)
+                rt_log("perf: upload deswizzle: %d uploads; over the texture workers %.1f MiB in %.1f ms, on the caller "
+                       "(under %llu KiB) %.1f MiB in %.1f ms", dz_n, dz_bytes[1] / 1048576.0, dz_ns[1] / 1e6,
+                       UP_PAR_MIN >> 10, dz_bytes[0] / 1048576.0, dz_ns[0] / 1e6);
+        }
+        for (k = g0; k < g1; k++) {
+            uint32_t lv = k / layers, ly = k % layers;
             uint32_t w = rg[k].imageExtent.width, h = rg[k].imageExtent.height, sl = rg[k].imageExtent.depth;
             uint32_t rb = (w + bw - 1) / bw * (uint32_t)bpb, rows = (h + bh - 1) / bh;
             size_t raw = (size_t)rb * rows * sl;
-            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = pt[k].tmp;
-            if (pt[k].bad) {
+            uint8_t *dst = stg + rg[k].bufferOffset, *tmp = pt[k - g0].tmp;
+            if (pt[k - g0].bad) {
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
@@ -320,25 +350,24 @@ static void upload(Tex *e) {
             }
             free(tmp);
         }
-    free(pt);
-    uint8_t *raw_copy = acheck ? malloc(total) : NULL;
-    if (raw_copy) memcpy(raw_copy, stg, total);
-    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    int checked = 0;
-    if (agpu) {
-        uint64_t a0 = perf_begin();
-        checked = vk_astc_record(cb, sb, total, ar, (int)n, e->f.astc_bw, e->f.astc_bh, e->f.astc_srgb, e->pub.image,
-                                 e->pub.aspect, e->f.astc_bc7, rbuf);
-        perf_end(PERF_ASTC, a0);
-        if (!checked)
-            log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was",
-                        (unsigned long long)e->pub.addr, d->format, d->width, d->height);
-    } else {
-        vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
-        if (e->dtwin.image) tex_twin_copy(e, cb, stg, total, rg, n);   // its depth twin (vk_tex_twin.c) from the same texels
+        free(pt);
+        if (acheck && (raw_copy = malloc(gtotal))) memcpy(raw_copy, stg, gtotal);   // one group
+        barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        if (agpu) {
+            uint64_t a0 = perf_begin();
+            checked = vk_astc_record(cb, sb, gtotal, ar + g0, (int)(g1 - g0), e->f.astc_bw, e->f.astc_bh,
+                                     e->f.astc_srgb, e->pub.image, e->pub.aspect, e->f.astc_bc7, rbuf);
+            perf_end(PERF_ASTC, a0);
+            if (!checked)
+                log_limited(&n_undecoded, "ASTC texture %#llx (fmt %#x %ux%u) not decoded on the GPU: left as it was",
+                            (unsigned long long)e->pub.addr, d->format, d->width, d->height);
+        } else {
+            vkCmdCopyBufferToImage(cb, sb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, g1 - g0, rg + g0);
+            if (e->dtwin.image) tex_twin_copy(e, cb, stg, gtotal, rg + g0, g1 - g0);   // its depth twin (vk_tex_twin.c)
+        }
+        barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
+        vk_upload_end();
     }
-    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
-    vk_upload_end();
     if (acheck) {   // waits for the GPU
         vk_upload_flush(1);
         if (checked) {

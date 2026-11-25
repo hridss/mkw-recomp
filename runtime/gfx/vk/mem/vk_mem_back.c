@@ -364,7 +364,7 @@ void phys_back(PoolRec *r, uint32_t first, uint32_t last) {
                        (unsigned long long)chunk_len(r, i));
         }
         if (got <= 0) {
-            if (++phys_failed_n <= 8) vram_log(0);
+            if (++phys_failed_n <= 8) vram_log_later();
             continue;
         }
         plat_mutex_lock(&pool_lock);   // resolves read the chunk under the shared lock

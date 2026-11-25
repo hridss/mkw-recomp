@@ -697,6 +697,59 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
 // by MKW_GPU_MEM_LIMIT_HEAP<n> (heap 0 on a discrete GPU, heap 1 on the Radeon 660M: the log's "mem: types" line),
 // fill what device-local memory is left, then back a physical pool; its chunk has to land outside device-local memory
 // and the GPU write through a virtual page has to read back. Skipped without a cap: it would fill a real GPU's VRAM.
+// The same for a sparse texture's tile (#63: RX 580 and Ryzen 7 5700G, "no memory for a tile slot" and black terrain):
+// a 128x128 RGBA8 sparse texture (one 64 KiB tile) in a virtual pool mapped to a physical one; its tile block has to land
+// outside device-local memory (alloc_local_or_any) and WriteTexels has to read back. Skipped where sparse images are off
+// or the driver's sparse types are device-local only (the hypothesis for NVIDIA, w63). full 0: the same with room in
+// device-local memory, where the tile has to stay.
+static int test_sparse_full(uint8_t *h, int full) {
+    const char *where = full ? "with device-local memory full" : "in device-local memory";
+    pool_t phys = {.magic = NVN_POOL_MAGIC, .flags = 0x189, .mem = (uint8_t *)(uintptr_t)(RT_GPU_VA_BASE + 0x500000000ull),
+                   .size = 0x40000, .game_mem = h + 0xb00000, .span = 0x40000};
+    pool_t virt = {.magic = NVN_POOL_MAGIC, .flags = 0x2a1, .mem = (uint8_t *)(uintptr_t)(RT_GPU_VA_BASE + 0x600000000ull),
+                   .size = 0x40000, .span = 0x40000};
+    GCHECK(vk_pool_init(&phys) && vk_pool_init(&virt), "vk_pool_init of the sparse test's pools");
+    nvn_mapping_t rq = {(const NVNmemoryPool *)(const void *)&phys, 0, 0, 0x10000, 0, 0};
+    GCHECK(vk_pool_map_virtual(&virt, 1, &rq), "MapVirtual of the sparse texture's page");
+    int64_t s0, f0, hb0, s1, f1, hb1;
+    vk_sparse_counts(&s0, &f0, &hb0);
+    tex_t t = make_tex(&virt, 0, 0x25, 128, 128, 1, 6);
+    t.d.flags = NVN_TEXTURE_FLAGS_SPARSE;
+    nvn_tex_layout(&t.d, &t.L);
+    const VkTexImage *img = vk_texture_get(&t);
+    GCHECK(img, "sparse texture image");
+    if (!vk_sparse_is(img->image)) {
+        vk_texture_release(&t), vk_pool_fini(&virt), vk_pool_fini(&phys);
+        printf("probe-vkmem: sparse tile %s: skipped (not a sparse image here)\n", where);
+        return 0;
+    }
+    vk_sparse_counts(&s1, &f1, &hb1);
+    enum { N = 128 * 128 * 4 };
+    uint8_t *want = malloc(N), *got = calloc(1, N);
+    for (int i = 0; i < N; i++) want[i] = rnd8();
+    NVNcopyRegion all = {0, 0, 0, 128, 128, 1};
+    vk_write_texels(&t, NULL, &all, want, 128 * 4, N);
+    view_t v;
+    memset(&v, 0, sizeof v);
+    v.set_levels = 1, v.nlevels = 1;
+    int ok = vk_texture_read_image(&t, &v, &all, got, 128 * 4, N);
+    int diff = 0, zero = 0, first = -1;
+    for (int i = 0; i < N; i++) {
+        if (got[i] != want[i] && !diff++) first = i;
+        zero += !got[i];
+    }
+    free(want), free(got);
+    vk_texture_release(&t), vk_pool_fini(&virt), vk_pool_fini(&phys);
+    GCHECK(ok && !diff, "sparse tile %s read back %s: %d of %d bytes differ (first at %d), %d zero", where,
+           ok ? "done" : "failed", diff, N, first, zero);
+    GCHECK(s1 > s0 && f1 == f0 && (hb1 > hb0) == full, "tile slots %lld -> %lld, failed %lld -> %lld, blocks outside "
+           "device-local %lld -> %lld", (long long)s0, (long long)s1, (long long)f0, (long long)f1, (long long)hb0,
+           (long long)hb1);
+    printf("probe-vkmem: sparse tile %s: backed %s and read back right\n", where, full ? "outside it" : "there");
+    g_gpu_checks += 3;
+    return 0;
+}
+
 static int test_phys_full(uint8_t *h) {
     int capped = 0;
     for (int i = 0; i < 16 && !capped; i++) {
@@ -707,7 +760,7 @@ static int test_phys_full(uint8_t *h) {
     if (!capped) {
         printf("probe-vkmem: physical pool with device-local memory full: skipped (needs MKW_GPU_MEM_LIMIT_HEAP<n>=1 on "
                "the device-local heap)\n");
-        return 0;
+        return test_sparse_full(h, 0);
     }
     VkCtx *c = vk_ctx();
     enum { MAX_FILL = 16384 };
@@ -724,6 +777,7 @@ static int test_phys_full(uint8_t *h) {
                    .size = 0x80000, .span = 0x80000};
     int bad = n == MAX_FILL || test_virtual(&phys, &virt);
     vk_mem_stats(&after);
+    if (!bad && test_sparse_full(h, 1)) return 1;
     vk_pool_fini(&virt), vk_pool_fini(&phys);
     for (int i = 0; i < n; i++) vmaFreeMemory(c->vma, fill[i]);
     free(fill);
@@ -738,9 +792,29 @@ static int test_phys_full(uint8_t *h) {
     return 0;
 }
 
+// An upload over UP_CHUNK goes in groups of levels, each with its own staging (vk_tex_upload.c; tr1 and m587 died on
+// one 47-186 MB staging buffer): RGBA8 2048x2048 with 3 levels is 16 + 4 + 1 MiB, so two groups, the second one's
+// offsets rebased. Every level has to read back equal.
+static int test_big_upload(uint8_t *h) {
+    pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = h + 0x1000000, .size = 0x1800000, .game_mem = h + 0x1000000};
+    GCHECK(vk_pool_init(&pool), "vk_pool_init of the 24 MiB texture pool");
+    uint8_t *lin[3] = {0};
+    tex_t t = make_tex(&pool, 0, 0x25, 2048, 2048, 3, 7);
+    int bad = fill_storage(&t, lin);
+    const VkTexImage *img = bad ? NULL : vk_texture_get(&t);
+    if (!bad && !img) printf("probe-vkmem: FAIL RGBA8 2048x2048 texture image\n");
+    for (unsigned lv = 0; img && !bad && lv < 3; lv++) bad = read_back(&t, lv, lin, 1, "RGBA8 2048x2048 in groups");
+    vk_texture_release(&t);
+    vk_pool_fini(&pool);
+    for (int i = 0; i < 3; i++) free(lin[i]);
+    if (bad || !img) return 1;
+    printf("probe-vkmem: 21 MiB upload staged in groups of levels, all 3 levels read back right\n");
+    return 0;
+}
+
 static int test_gpu(void) {
     uint64_t heap = 0;
-    GCHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
+    GCHECK(mem_set_heap_size(64ull << 20, &heap) == 0 && heap, "SetHeapSize 64 MiB");
     uint8_t *h = (uint8_t *)(uintptr_t)heap;
     pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x24, .mem = h + 0x100000, .size = 0x40000, .game_mem = h + 0x100000};
     pool_t tpool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = h + 0x400000, .size = 0x100000, .game_mem = h + 0x400000};
@@ -752,6 +826,7 @@ static int test_gpu(void) {
     if (vk_mem_shadow_on() && test_merge(&pool)) return 1;
     GCHECK(vk_pool_init(&tpool), "vk_pool_init of the texture pool");
     if (test_textures(&tpool, &phys)) return 1;
+    if (test_big_upload(h)) return 1;
     if (test_phys_full(h)) return 1;
     const char *cap = cfg_get("MKW_SHADOW_SUBMIT");   // a measurement, off by default
     if (vk_mem_shadow_on() && cap && !strcmp(cap, "1") && test_capture(&pool)) return 1;

@@ -45,6 +45,42 @@ static void index_put(PoolRec *r) {
     if (!pidx_insert(&pool_index, &e)) rt_fatal("vk: out of memory for the pool index");
 }
 
+// For the "mem: vram" line: the live pool records by state, to tell a leak from pools the game keeps. Shadowed
+// (GPU copy), imported or placed, lazy never backed, physical, virtual; and the CPU-visible records whose range
+// overlaps an earlier one (a pool the game stopped using without Finalize while its storage went to a new pool), with
+// the bytes of their GPU copies, and the shadow bytes by age (since the pool was set up).
+void vk_pool_census_log(void) {
+    int64_t n[5] = {0}, b[5] = {0}, ov_n = 0, ov_b = 0, age[3] = {0};
+    uint32_t now = (uint32_t)plat_now_ms();   // born_ms is 32-bit: the difference wraps correctly
+    uint64_t maxhi = 0;
+    // Not waiting: a failed shadow or chunk allocation logs this from lazy_back, which holds pool_lock exclusively (mem1,
+    // mem3, mem4, 24/11/2026: the thread waited for itself and the game froze at the first race's start).
+    if (!plat_mutex_trylock_shared(&pool_lock)) {
+        rt_log("mem: vram pools: skipped (the pool index is locked)");
+        return;
+    }
+    for (int i = 0; i < pool_index.n; i++) {   // sorted by lo
+        PoolRec *r = pool_index.e[i].buf;
+        int k = r->kind == POOL_PHYS ? 3 : r->kind == POOL_VIRT ? 4 : r->smap ? 0 : r->lazy && !r->buf ? 2 : 1;
+        n[k]++, b[k] += (int64_t)r->size;
+        uint32_t ms = now - r->born_ms;
+        if (k == 0) age[ms < 60000 ? 0 : ms < 600000 ? 1 : 2] += (int64_t)r->size;
+        if (r->kind != POOL_IMPORT) continue;
+        if (r->lo < maxhi) ov_n++, ov_b += r->smap ? (int64_t)(r->import_hi - r->import_lo) : 0;
+        if (r->lo + r->size > maxhi) maxhi = r->lo + r->size;
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+    int64_t rn, rb;
+    nvn_pool_reinit_stats(&rn, &rb);
+    const double M = 1048576.0;
+    rt_log("mem: vram pools: shadowed %lld %.0f MiB (set up < 1 min %.0f, < 10 min %.0f, older %.0f), imported %lld %.0f "
+           "MiB, lazy unbacked %lld %.0f MiB, physical %lld %.0f MiB, virtual %lld %.0f MiB; overlapping an earlier pool "
+           "%lld (shadows %.0f MiB); retiring %d; initialized again while live %lld (%.0f MiB)",
+           (long long)n[0], b[0] / M, age[0] / M, age[1] / M, age[2] / M, (long long)n[1], b[1] / M, (long long)n[2],
+           b[2] / M, (long long)n[3], b[3] / M, (long long)n[4], b[4] / M, (long long)ov_n, ov_b / M, retiring_count(),
+           (long long)rn, rb / M);
+}
+
 static PoolRec *phys_find(const pool_t *key) {
     for (int i = 0; i < nphys; i++) if (phys_list[i]->key == key) return phys_list[i];
     return NULL;

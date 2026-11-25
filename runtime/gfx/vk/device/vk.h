@@ -378,6 +378,9 @@ int vk_sparse_create(const VkImageCreateInfo *ci, const nvn_texdesc *d, uint64_t
 void vk_sparse_shutdown(void);   // after textures, retired work and device idle; before the VMA allocator
 uint64_t vk_sparse_destroy(VkImage img);   // the submission its binds are done by (0: none)
 int vk_sparse_is(VkImage img);   // 1: img is a sparse image made by vk_sparse_create
+// Tile slots live, slots that found no memory, tile blocks placed outside device-local memory (probe-vkmem, #63).
+void vk_sparse_counts(int64_t *slots, int64_t *failed, int64_t *host_blocks);
+void vk_sparse_binds_now(void);   // issues the pending binds (vk_upload_flush, before its batch)
 void vk_sparse_remap(uint64_t addr, uint64_t size);
 // A copy or a pass wrote the region (w == 0: the whole level) of img: counted when img is sparse.
 void vk_sparse_written(VkImage img, uint32_t level, uint32_t layer0, uint32_t layers, int32_t x, int32_t y, uint32_t w,

@@ -767,6 +767,12 @@ int vk_sparse_is(VkImage img) {
     return s != NULL;
 }
 
+void vk_sparse_counts(int64_t *slots, int64_t *failed, int64_t *host_blocks) {
+    plat_mutex_lock(&sp_lock);
+    *slots = n_slots, *failed = n_failed, *host_blocks = n_host_blocks;
+    plat_mutex_unlock(&sp_lock);
+}
+
 void vk_sparse_remap(uint64_t lo, uint64_t size) {
     plat_mutex_lock(&sp_lock);
     VkCtx *c = vk_ctx();
@@ -838,6 +844,9 @@ VkSparseOrder vk_sparse_order(uint64_t fence, int binds) {
         ndying_tails = 0;
     }
     if (ndirty || ntail_pending) {
+        // fence 0 (an upload batch sent on its own, vk_upload_flush): no submission value yet, the one being recorded
+        // or the next waits for it, as tail_bind_now
+        uint64_t bfence = fence ? fence : vk_sync_issued() + 2;
         int ni = 0, nb = 0, total = 0, no = 0, nm = 0, mtotal = 0;
         for (SparseImg *s = images; s; s = s->next) {
             total += s->ndl;
@@ -851,7 +860,7 @@ VkSparseOrder vk_sparse_order(uint64_t fence, int binds) {
         for (SparseImg *s = images; s; s = s->next) {
             if (!s->tail_pending) continue;
             tail_binds(s, &ib[ni], bb + nb, &ob[no], mb + nm);
-            s->bind_fence = fence;
+            s->bind_fence = bfence;
             nb += (int)ib[ni].bindCount, nm += (int)ob[no].bindCount;
             if (ib[ni].bindCount) ni++;
             if (ob[no].bindCount) no++;
@@ -863,7 +872,7 @@ VkSparseOrder vk_sparse_order(uint64_t fence, int binds) {
             if (!s->ndl) continue;
             if (merge) qsort(s->dl, (size_t)s->ndl, sizeof *s->dl, by_u32);
             int nb0 = nb;
-            s->bind_fence = fence;   // submission `fence` waits for this bind (bind_sem, or order_tl)
+            s->bind_fence = bfence;   // submission `fence` waits for this bind (bind_sem, or order_tl)
             for (int k = 0; k < s->ndl;) {
                 int run = merge ? run_len(s, k) : 1;
                 run1 += run == 1, run_max = run > run_max ? run : run_max;
@@ -924,11 +933,26 @@ VkSparseOrder vk_sparse_order(uint64_t fence, int binds) {
     return o;
 }
 
+// Pending binds out ahead of an upload batch sent on its own (vk_upload_flush), which may copy into tiles mapped since
+// the last submission. Not under cmd_lock: slot_get and vk_sparse_dump record uploads with sp_lock held. Under the
+// queue lock, as vk_sync.c: taking it sends the parts that already hold an order value, so the bind (which waits for
+// the newest value) never goes to the queue ahead of the submission that signals it. Without it the queue waited for
+// itself and the game froze after the cup's video (mem1, 24/11/2026: every thread waiting, no CPU).
+static _Thread_local int sp_dumping;
+void vk_sparse_binds_now(void) {
+    if (sp_dumping || !(__atomic_load_n(&ndirty, __ATOMIC_RELAXED) || __atomic_load_n(&ntail_pending, __ATOMIC_RELAXED)))
+        return;
+    vk_queue_lock();
+    vk_sparse_order(0, 2);
+    vk_queue_unlock();
+}
+
 // ---- runtime/gfx/cap: the written slots out (key and texels), and back in as the slots are made again
 uint64_t vk_sparse_dump(void (*emit)(const void *key, uint32_t klen, const void *p, uint64_t n, void *ctx), void *ctx) {
     vk_sync_fence_wait(vk_sync_issued(), UINT64_MAX);
     vk_upload_flush(1);
     plat_mutex_lock(&sp_lock);
+    sp_dumping = 1;   // its flushes copy out of the blocks' buffers, no image binds needed (and sp_lock is held)
     uint64_t bytes = 0;
     for (uint32_t i = 0; i < slots.cap; i++) {
         Slot *sl = slots.vals ? slots.vals[i] : NULL;
@@ -947,6 +971,7 @@ uint64_t vk_sparse_dump(void (*emit)(const void *key, uint32_t klen, const void 
         vmaDestroyBuffer(vk_ctx()->vma, sb, sa);
         bytes += n;
     }
+    sp_dumping = 0;
     plat_mutex_unlock(&sp_lock);
     return bytes;
 }

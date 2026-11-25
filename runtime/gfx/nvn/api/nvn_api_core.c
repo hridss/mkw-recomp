@@ -325,10 +325,30 @@ static void pool_label(const pool_t *o, int live) {
 // Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
 // loader threads, which held a virtual core through it while job workers waited (MKW_CORE_DIAG). The thread gives
 // the core up, as for any blocking host call.
+static void pool_finalize(pool_t *o);
+// Pools initialized again while still live (no Finalize in between), and their bytes: the back end's record of the old
+// one, with its GPU copy, had no owner left and stayed for the rest of the session.
+static int64_t reinit_n, reinit_bytes;
+
+void nvn_pool_reinit_stats(int64_t *n, int64_t *bytes) {
+    *n = __atomic_load_n(&reinit_n, __ATOMIC_RELAXED);
+    *bytes = __atomic_load_n(&reinit_bytes, __ATOMIC_RELAXED);
+}
+
 NVN_API(nvnMemoryPoolInitialize) {
     NVN_BLOCKING();
     pool_t *o = arg_p(c, 0);
     const pool_builder_t *s = arg_p(c, 1);
+    // A live pool initialized again: the old one is finalized first, as the game skipped it (the console driver keeps
+    // nothing of a pool outside the object and its storage; we keep a GPU copy).
+    if (o->magic == NVN_POOL_MAGIC) {
+        int64_t k = __atomic_add_fetch(&reinit_n, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&reinit_bytes, (int64_t)o->size, __ATOMIC_RELAXED);
+        if (k <= 4 || !(k & (k - 1)))
+            rt_log("nvn: MemoryPoolInitialize on live pool %p (mem %p size %#llx flags %#x): finalized first (%lld so far)",
+                   (void *)o, (void *)o->mem, (unsigned long long)o->size, o->flags, (long long)k);
+        pool_finalize(o);
+    }
     memset(o, 0, sizeof *o);
     o->magic = NVN_POOL_MAGIC;
     o->flags = s->flags;
@@ -364,6 +384,9 @@ NVN_API(nvnMemoryPoolFinalize) {
     NVN_BLOCKING();   // as nvnMemoryPoolInitialize
     pool_t *o = arg_p(c, 0);
     if (o->magic != NVN_POOL_MAGIC) return;
+    pool_finalize(o);
+}
+static void pool_finalize(pool_t *o) {
     if (pool_gpu_visible(o)) index_del(o);
     pool_label(o, 0);
     gfx_backend()->pool_fini(o);
